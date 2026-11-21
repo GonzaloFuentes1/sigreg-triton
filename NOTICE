@@ -1,0 +1,14 @@
+sigreg-triton
+Copyright 2026 Gonzalo Fuentes
+
+This product implements SIGReg (Sketched Isotropic Gaussian Regularization) with the
+sliced Epps-Pulley statistic, as described in:
+
+  Randall Balestriero and Yann LeCun. "LeJEPA: Provable and Scalable Self-Supervised
+  Learning Without the Heuristics". arXiv:2511.08544, 2025.
+
+The mathematical definition (integration grid, quadrature weights, normalization,
+distributed all-reduce semantics and direction sampling) follows the official LeJEPA
+code at https://github.com/galilai-group/lejepa (commit c293d291). No source code from
+that repository is included here; the official package is only installed, unmodified,
+as an optional test/benchmark dependency.
