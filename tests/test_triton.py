@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from sigreg_triton import SIGReg, epps_pulley, sigreg
+from sigreg_triton import ecf as _ecf
 from sigreg_triton.ecf import ecf_triton, triton_available
 from sigreg_triton.reference import ecf_reference, epps_pulley_grid, epps_pulley_reference
 
@@ -23,6 +24,19 @@ pytestmark = [
 ]
 
 EPS32 = torch.finfo(torch.float32).eps
+
+# Triton releases that cannot compile the fast kernels (3.1, 3.2) only run the legacy ones.
+_ONLY_LEGACY = triton_available() and not _ecf._fast_kernels_compile(torch.cuda.current_device())
+
+
+@pytest.fixture(autouse=True, params=["fast", "legacy"])
+def kernels(request, monkeypatch):
+    """Run every test with both kernel families."""
+    legacy = request.param == "legacy"
+    if _ONLY_LEGACY and not legacy:
+        pytest.skip("this Triton release cannot compile the fast kernels")
+    monkeypatch.setattr(_ecf, "_use_legacy_kernels", lambda device=None: legacy)
+    return request.param
 
 
 def _ecf64(x, t_max, n_points):

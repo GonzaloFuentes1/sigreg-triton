@@ -37,6 +37,11 @@ pip install -e .            # needs torch; Triton ships with the CUDA builds of 
 pip install -e ".[dev]"     # + pytest, ruff
 ```
 
+The fast kernels need a Triton release that can carry tuples through loops. Triton 3.1 and 3.2
+(torch 2.5 and 2.6) cannot: the first call detects the compile error and switches to slower
+legacy kernels with the same results (tested on GPU with Triton 3.1, 3.2 and 3.9).
+`SIGREG_TRITON_LEGACY=1` or `=0` forces one family.
+
 On CPU, or without Triton, everything runs through the pure-PyTorch reference.
 
 ## Usage

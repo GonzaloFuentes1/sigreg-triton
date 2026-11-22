@@ -25,6 +25,7 @@ Design (choices measured with ``benchmarks/tune.py`` on an H100):
 """
 
 import functools
+import os
 
 import torch
 from torch.autograd.function import once_differentiable
@@ -34,6 +35,7 @@ from ._dist import all_reduce_mean_, is_initialized, world_size
 try:
     import triton
     import triton.language as tl
+    from triton.compiler.errors import CompilationError
     from triton.language.extra import libdevice
 except ImportError:  # pragma: no cover - exercised on CPU-only installs
     triton = None
@@ -187,6 +189,98 @@ if triton is not None:
                 g += tl.load(dx_ptrs, mask=mask, other=0.0)
             tl.store(dx_ptrs, g.to(dx_ptr.dtype.element_ty), mask=mask)
 
+    # Kernels for Triton releases that cannot compile the loop-carried tuples above (3.1 and
+    # 3.2, shipped with torch <= 2.6). Same math and partials layout, one tile accumulator:
+    # the forward loops over knots and recomputes exact phases, the backward loops over knots
+    # reading the gradient vectors from memory. Used when the fast kernels fail to compile.
+    @triton.jit
+    def _ecf_fwd_kernel_legacy(
+        x_ptr,
+        part_ptr,
+        N,
+        M,
+        rows_per_chunk,
+        stride_b,
+        stride_n,
+        stride_m,
+        dt,
+        inv_n,
+        K: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+    ):
+        pid_c = tl.program_id(0)
+        pid_m = tl.program_id(1)
+        pid_b = tl.program_id(2)
+        n_chunks = tl.num_programs(0)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < M
+        x_base = x_ptr + pid_b.to(tl.int64) * stride_b
+        out = part_ptr + (pid_b * n_chunks + pid_c).to(tl.int64) * (2 * K * M)
+        n_start = pid_c * rows_per_chunk
+        n_end = tl.minimum(n_start + rows_per_chunk, N)
+        for kk in range(0, K):
+            acc_c = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
+            acc_s = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
+            for n0 in range(n_start, n_end, BLOCK_N):
+                offs_n = n0 + tl.arange(0, BLOCK_N)
+                mask = (offs_n < n_end)[:, None] & mask_m[None, :]
+                ptrs = x_base + offs_n[:, None].to(tl.int64) * stride_n + offs_m[None, :] * stride_m
+                phase = tl.load(ptrs, mask=mask, other=0.0).to(tl.float32) * (dt * kk)
+                acc_c += tl.where(mask, libdevice.cos(phase), 0.0)
+                acc_s += tl.where(mask, libdevice.sin(phase), 0.0)
+            tl.store(out + kk * M + offs_m, tl.sum(acc_c, axis=0) * inv_n, mask=mask_m)
+            tl.store(out + (K + kk) * M + offs_m, tl.sum(acc_s, axis=0) * inv_n, mask=mask_m)
+
+    @triton.jit
+    def _ecf_bwd_kernel_legacy(
+        x_ptr,
+        gc_ptr,
+        gs_ptr,
+        dx_ptr,
+        N,
+        M,
+        rows_per_chunk,
+        stride_xb,
+        stride_xn,
+        stride_xm,
+        stride_gb,
+        stride_gm,
+        stride_gk,
+        dt,
+        dt_over_n,
+        K: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+    ):
+        pid_c = tl.program_id(0)
+        pid_m = tl.program_id(1)
+        pid_b = tl.program_id(2)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < M
+        g_base = pid_b.to(tl.int64) * stride_gb + offs_m * stride_gm
+        x_base = x_ptr + pid_b.to(tl.int64) * stride_xb
+        dx_base = dx_ptr + pid_b.to(tl.int64) * N * M
+        n_start = pid_c * rows_per_chunk
+        n_end = tl.minimum(n_start + rows_per_chunk, N)
+        for n0 in range(n_start, n_end, BLOCK_N):
+            offs_n = n0 + tl.arange(0, BLOCK_N)
+            mask = (offs_n < n_end)[:, None] & mask_m[None, :]
+            ptrs = x_base + offs_n[:, None].to(tl.int64) * stride_xn + offs_m[None, :] * stride_xm
+            theta = tl.load(ptrs, mask=mask, other=0.0).to(tl.float32) * dt
+            g = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
+            for kk in range(1, K):  # knot 0 has t = 0 and no gradient
+                scale = kk * dt_over_n
+                gc = tl.load(gc_ptr + g_base + kk * stride_gk, mask=mask_m, other=0.0)
+                gs = tl.load(gs_ptr + g_base + kk * stride_gk, mask=mask_m, other=0.0)
+                phase = theta * kk
+                g += libdevice.cos(phase) * (gs.to(tl.float32) * scale)[None, :]
+                g -= libdevice.sin(phase) * (gc.to(tl.float32) * scale)[None, :]
+            dx_ptrs = dx_base + offs_n[:, None].to(tl.int64) * M + offs_m[None, :]
+            tl.store(dx_ptrs, g.to(dx_ptr.dtype.element_ty), mask=mask)
+
 
 # Tile configurations (BLOCK_N, BLOCK_M, num_warps, programs per SM); see benchmarks/tune.py.
 _FWD_CONFIG = (4, 128, 4, 2)
@@ -197,6 +291,38 @@ _KNOTS_PER_GROUP = 17
 @functools.cache
 def _num_sms(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+@functools.cache
+def _fast_kernels_compile(device_index: int) -> bool:
+    """Whether this Triton release compiles the fast kernels.
+
+    They carry tuples through loops, which Triton 3.1 and 3.2 reject at compile time; a tiny
+    forward and backward are compiled once per device to find out.
+    """
+    x = torch.zeros((1, 4, 4), device=torch.device("cuda", device_index))
+    g = torch.zeros((1, 4, 3), device=x.device)
+    try:
+        _ecf_forward_fast(x, 0.1, 3)
+        _ecf_backward_fast(x, g, g, 0.1, 3)
+    except CompilationError:
+        return False
+    return True
+
+
+def _use_legacy_kernels(device: torch.device | None = None) -> bool:
+    """True when the fast kernels do not compile with the installed Triton.
+
+    ``SIGREG_TRITON_LEGACY=1`` forces the legacy kernels, ``=0`` the fast ones.
+    """
+    forced = os.environ.get("SIGREG_TRITON_LEGACY")
+    if forced is not None:
+        return forced == "1"
+    if device is None or device.index is None:
+        index = torch.cuda.current_device()
+    else:
+        index = device.index
+    return not _fast_kernels_compile(index)
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -218,6 +344,38 @@ def _row_chunks(n: int, other_programs: int, block_n: int, per_sm: int, device) 
 
 
 def _ecf_forward(x3: torch.Tensor, dt: float, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    if _use_legacy_kernels(x3.device):
+        return _ecf_forward_legacy(x3, dt, k)
+    return _ecf_forward_fast(x3, dt, k)
+
+
+def _ecf_forward_legacy(x3: torch.Tensor, dt: float, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    b, n, m = x3.shape
+    block_n, block_m, num_warps, per_sm = _FWD_CONFIG
+    m_blocks = _cdiv(m, block_m)
+    n_chunks, rows_per_chunk = _row_chunks(n, m_blocks * b, block_n, per_sm, x3.device)
+    partials = torch.empty((b, n_chunks, 2, k, m), device=x3.device, dtype=torch.float32)
+    _ecf_fwd_kernel_legacy[(n_chunks, m_blocks, b)](
+        x3,
+        partials,
+        n,
+        m,
+        rows_per_chunk,
+        x3.stride(0),
+        x3.stride(1),
+        x3.stride(2),
+        dt,
+        1.0 / n,
+        K=k,
+        BLOCK_N=block_n,
+        BLOCK_M=block_m,
+        num_warps=num_warps,
+    )
+    means = partials[:, 0] if n_chunks == 1 else partials.sum(dim=1)
+    return means[:, 0].transpose(1, 2), means[:, 1].transpose(1, 2)
+
+
+def _ecf_forward_fast(x3: torch.Tensor, dt: float, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     b, n, m = x3.shape
     block_n, block_m, num_warps, per_sm = _FWD_CONFIG
     n_groups, kg = _knot_groups(k)
@@ -251,9 +409,49 @@ def _ecf_forward(x3: torch.Tensor, dt: float, k: int) -> tuple[torch.Tensor, tor
 def _ecf_backward(
     x3: torch.Tensor, grad_cos: torch.Tensor, grad_sin: torch.Tensor, dt: float, k: int
 ) -> torch.Tensor:
-    b, n, m = x3.shape
-    if grad_cos.stride() != grad_sin.stride():  # the kernel takes one set of strides
+    if grad_cos.stride() != grad_sin.stride():  # the kernels take one set of strides
         grad_cos, grad_sin = grad_cos.contiguous(), grad_sin.contiguous()
+    if _use_legacy_kernels(x3.device):
+        return _ecf_backward_legacy(x3, grad_cos, grad_sin, dt, k)
+    return _ecf_backward_fast(x3, grad_cos, grad_sin, dt, k)
+
+
+def _ecf_backward_legacy(
+    x3: torch.Tensor, grad_cos: torch.Tensor, grad_sin: torch.Tensor, dt: float, k: int
+) -> torch.Tensor:
+    b, n, m = x3.shape
+    block_n, block_m, num_warps, per_sm = _BWD_CONFIG
+    m_blocks = _cdiv(m, block_m)
+    n_chunks, rows_per_chunk = _row_chunks(n, m_blocks * b, block_n, per_sm, x3.device)
+    dx = torch.empty((b, n, m), device=x3.device, dtype=x3.dtype)
+    _ecf_bwd_kernel_legacy[(n_chunks, m_blocks, b)](
+        x3,
+        grad_cos,
+        grad_sin,
+        dx,
+        n,
+        m,
+        rows_per_chunk,
+        x3.stride(0),
+        x3.stride(1),
+        x3.stride(2),
+        grad_cos.stride(0),
+        grad_cos.stride(1),
+        grad_cos.stride(2),
+        dt,
+        dt / n,
+        K=k,
+        BLOCK_N=block_n,
+        BLOCK_M=block_m,
+        num_warps=num_warps,
+    )
+    return dx
+
+
+def _ecf_backward_fast(
+    x3: torch.Tensor, grad_cos: torch.Tensor, grad_sin: torch.Tensor, dt: float, k: int
+) -> torch.Tensor:
+    b, n, m = x3.shape
     block_n, block_m, num_warps, per_sm = _BWD_CONFIG
     n_groups, kg = _knot_groups(k)
     m_blocks = _cdiv(m, block_m)
